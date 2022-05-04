@@ -12,9 +12,14 @@ from cv_bridge import CvBridge
 from duckietown.dtros import DTROS, NodeType, TopicType
 from duckietown_msgs.msg import Segment, SegmentList
 from geometry_msgs.msg import Point as PointMsg
-from image_processing.ground_projection_geometry import GroundProjectionGeometry, Point
-from image_processing.rectification import Rectify
+# from image_processing.ground_projection_geometry import GroundProjectionGeometry, Point
+# from image_processing.rectification import Rectify
 from sensor_msgs.msg import CameraInfo, CompressedImage
+
+from dt_computer_vision.camera import CameraModel
+from dt_computer_vision.camera.types import Rectifier, Pixel, NormalizedImagePoint, Point
+from dt_computer_vision.ground_projection import GroundProjector
+from dt_computer_vision.ground_projection.types import GroundPoint
 
 
 class GroundProjectionNode(DTROS):
@@ -43,8 +48,9 @@ class GroundProjectionNode(DTROS):
     """
 
     bridge: CvBridge
-    ground_projector: Optional[GroundProjectionGeometry]
-    rectifier: Optional[Rectify]
+    ground_projector: Optional[GroundProjector]
+    # rectifier: Optional[Rectifier]
+    camera: Optional[CameraModel]
 
     def __init__(self, node_name: str):
         # Initialize the DTROS parent class
@@ -52,8 +58,9 @@ class GroundProjectionNode(DTROS):
 
         self.bridge = CvBridge()
         self.ground_projector = None
-        self.rectifier = None
-        self.homography = self.load_extrinsics()
+        # self.rectifier = None
+        self.camera = None
+        self.homography = np.reshape(self.load_extrinsics(), (3, 3))
         self.first_processing_done = False
         self.camera_info_received = False
 
@@ -78,13 +85,6 @@ class GroundProjectionNode(DTROS):
 
         self.debug_img_bg = None
 
-        # Seems to be never used:
-        # self.service_homog_ = rospy.Service("~estimate_homography", EstimateHomography,
-        # self.estimate_homography_cb)
-        # self.service_gnd_coord_ = rospy.Service("~get_ground_coordinate", GetGroundCoord,
-        # self.get_ground_coordinate_cb)
-        # self.service_img_coord_ = rospy.Service("~get_image_coordinate", GetImageCoord,
-        # self.get_image_coordinate_cb)
 
     def cb_camera_info(self, msg: CameraInfo):
         """
@@ -96,43 +96,24 @@ class GroundProjectionNode(DTROS):
 
         """
         if not self.camera_info_received:
-            self.rectifier = Rectify(msg)
-            self.ground_projector = GroundProjectionGeometry(
-                im_width=msg.width, im_height=msg.height, homography=np.array(self.homography).reshape((3, 3))
+            _K = np.reshape(msg.K, (3,3)).tolist()
+            # _K[0][2] = _K[0][2] - x
+            # _K[1][2] = _K[1][2] - y
+            _P = np.reshape(msg.P, (3, 4)).tolist()
+            # _P[0][2] = _P[0][2] - x
+            # _P[1][2] = _P[1][2] - y  # TODO: cropped x, y
+
+            self.camera = CameraModel(
+                width=msg.width,  # TODO: cropped size
+                height=msg.height,
+                K=_K,
+                D=msg.D,
+                P=_P,
+                H=self.homography,
             )
+            # self.rectifier = camera.rectifier
+            self.ground_projector = GroundProjector(camera=self.camera)
         self.camera_info_received = True
-
-    def pixel_msg_to_ground_msg(self, point_msg) -> PointMsg:
-        """
-        Creates a :py:class:`ground_projection.Point` object from a normalized point message from an
-        unrectified
-        image. It converts it to pixel coordinates and rectifies it. Then projects it to the ground plane and
-        converts it to a ROS Point message.
-
-        Args:
-            point_msg (:obj:`geometry_msgs.msg.Point`): Normalized point coordinates from an unrectified
-            image.
-
-        Returns:
-            :obj:`geometry_msgs.msg.Point`: Point coordinates in the ground reference frame.
-
-        """
-        # normalized coordinates to pixel:
-        norm_pt = Point.from_message(point_msg)
-        pixel = self.ground_projector.vector2pixel(norm_pt)
-        # rectify
-        rect = self.rectifier.rectify_point(pixel)
-        # convert to Point
-        rect_pt = Point.from_message(rect)
-        # project on ground
-        ground_pt = self.ground_projector.pixel2ground(rect_pt)
-        # point to message
-        ground_pt_msg = PointMsg()
-        ground_pt_msg.x = ground_pt.x
-        ground_pt_msg.y = ground_pt.y
-        ground_pt_msg.z = ground_pt.z
-
-        return ground_pt_msg
 
     def lineseglist_cb(self, seglist_msg):
         """
@@ -144,15 +125,37 @@ class GroundProjectionNode(DTROS):
             unrectified images
 
         """
+        def _fill_point_msg(pt: Point) -> PointMsg:
+            p_msg = PointMsg()
+            p_msg.x = pt.x
+            p_msg.y = pt.y
+            p_msg.z = 0
+            return p_msg
+
         if self.camera_info_received:
             seglist_out = SegmentList()
             seglist_out.header = seglist_msg.header
             for received_segment in seglist_msg.segments:
                 new_segment = Segment()
-                new_segment.points[0] = self.pixel_msg_to_ground_msg(received_segment.pixels_normalized[0])
-                new_segment.points[1] = self.pixel_msg_to_ground_msg(received_segment.pixels_normalized[1])
+                # distorted pixels
+                l0, l1 = received_segment.pixels_normalized
+                p0: Pixel = Pixel(l0[0], l0[1])
+                p1: Pixel = Pixel(l1[2], l1[3])
+                # distorted pixels to rectified pixels
+                p0_rect: Pixel = self.camera.rectifier.rectify_pixel(p0)
+                p1_rect: Pixel = self.camera.rectifier.rectify_pixel(p1)
+                # rectified pixel to normalized coordinates
+                p0_norm: NormalizedImagePoint = self.camera.pixel2vector(p0_rect)
+                p1_norm: NormalizedImagePoint = self.camera.pixel2vector(p1_rect)
+                # project image point onto the ground plane
+                grounded_p0: GroundPoint = self.ground_projector.vector2ground(p0_norm)
+                grounded_p1: GroundPoint = self.ground_projector.vector2ground(p1_norm)
+
+                new_segment.points[0] = _fill_point_msg(grounded_p0)
+                new_segment.points[1] = _fill_point_msg(grounded_p1)
+
                 new_segment.color = received_segment.color
-                # TODO what about normal and points
+                # TODO what about normal and points <= here before ente-new-deal
                 seglist_out.segments.append(new_segment)
             self.pub_lineseglist.publish(seglist_out)
 
@@ -166,25 +169,6 @@ class GroundProjectionNode(DTROS):
                 self.pub_debug_img.publish(debug_image_msg)
         else:
             self.log("Waiting for a CameraInfo message", "warn")
-
-    # def get_ground_coordinate_cb(self, req):
-    #     return GetGroundCoordResponse(self.pixel_msg_to_ground_msg(req.uv))
-    #
-    # def get_image_coordinate_cb(self, req):
-    #     return GetImageCoordResponse(self.gpg.ground2pixel(req.gp))
-    #
-    # def estimate_homography_cb(self, req):
-    #     rospy.loginfo("Estimating homography")
-    #     rospy.loginfo("Waiting for raw image")
-    #     img_msg = rospy.wait_for_message("/" + self.robot_name + "/camera_node/image/raw", Image)
-    #     rospy.loginfo("Got raw image")
-    #     try:
-    #         cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
-    #     except CvBridgeError as e:
-    #         rospy.logerr(e)
-    #     self.gp.estimate_homography(cv_image)
-    #     rospy.loginfo("wrote homography")
-    #     return EstimateHomographyResponse()
 
     def load_extrinsics(self):
         """
