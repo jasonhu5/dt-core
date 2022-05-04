@@ -6,25 +6,19 @@ import rospy
 from cv_bridge import CvBridge
 from sensor_msgs.msg import CompressedImage, Image
 from duckietown_msgs.msg import Segment, SegmentList, AntiInstagramThresholds
-from line_detector import LineDetector, ColorRange, plotSegments, plotMaps
-from image_processing.anti_instagram import AntiInstagram
 
 from duckietown.dtros import DTROS, NodeType, TopicType
+
+from typing import Dict, List
+from turbojpeg import TurboJPEG
+from dt_computer_vision.line_detection import LineDetector
+from dt_computer_vision.line_detection.types import ColorRange, Detections
+from dt_computer_vision.line_detection.rendering import draw_segments, draw_maps
+from dt_computer_vision.anti_instagram import AntiInstagram
 
 
 class LineDetectorNode(DTROS):
     """
-    The ``LineDetectorNode`` is responsible for detecting the line white, yellow and red line segment in an image and
-    is used for lane localization.
-
-    Upon receiving an image, this node reduces its resolution, cuts off the top part so that only the
-    road-containing part of the image is left, extracts the white, red, and yellow segments and publishes them.
-    The main functionality of this node is implemented in the :py:class:`line_detector.LineDetector` class.
-
-    The performance of this node can be very sensitive to its configuration parameters. Therefore, it also provides a
-    number of debug topics which can be used for fine-tuning these parameters. These configuration parameters can be
-    changed dynamically while the node is running via ``rosparam set`` commands.
-
     Args:
         node_name (:obj:`str`): a unique, descriptive name for the node that ROS will use
 
@@ -60,10 +54,10 @@ class LineDetectorNode(DTROS):
         self._top_cutoff = rospy.get_param("~top_cutoff", None)
 
         self.bridge = CvBridge()
+        self.jpeg = TurboJPEG()
 
         # The thresholds to be used for AntiInstagram color correction
         self.ai_thresholds_received = False
-        self.anti_instagram_thresholds = dict()
         self.ai = AntiInstagram()
 
         # This holds the colormaps for the debug/ranges images after they are computed once
@@ -72,7 +66,8 @@ class LineDetectorNode(DTROS):
         # Create a new LineDetector object with the parameters from the Parameter Server / config file
         self.detector = LineDetector(**self._line_detector_parameters)
         # Update the color ranges objects
-        self.color_ranges = {color: ColorRange.fromDict(d) for color, d in list(self._colors.items())}
+        self.color_ranges: Dict[str, ColorRange] = {
+            color: ColorRange.fromDict(d) for color, d in list(self._colors.items())}
 
         # Publishers
         self.pub_lines = rospy.Publisher(
@@ -108,8 +103,8 @@ class LineDetectorNode(DTROS):
         )
 
     def thresholds_cb(self, thresh_msg):
-        self.anti_instagram_thresholds["lower"] = thresh_msg.low
-        self.anti_instagram_thresholds["higher"] = thresh_msg.high
+        self.ai.higher_threshold = thresh_msg.high
+        self.ai.lower_threshold = thresh_msg.low
         self.ai_thresholds_received = True
 
     def image_cb(self, image_msg):
@@ -133,29 +128,25 @@ class LineDetectorNode(DTROS):
 
         # Decode from compressed image with OpenCV
         try:
-            image = self.bridge.compressed_imgmsg_to_cv2(image_msg)
+            image = self.jpeg.decode(image_msg)
         except ValueError as e:
             self.logerr(f"Could not decode image: {e}")
             return
 
+        # ente-new-deal
+        # TODO: either change config to use a single float as scale, or change AntiInstagram.apply to take fx and fy
+        image_scale = float(self._img_size[0]) / image.shape[0]
         # Perform color correction
         if self.ai_thresholds_received:
-            image = self.ai.apply_color_balance(
-                self.anti_instagram_thresholds["lower"], self.anti_instagram_thresholds["higher"], image
-            )
+            image = self.ai.apply(image=image, image_scale=image_scale)
 
         # Resize the image to the desired dimensions
-        height_original, width_original = image.shape[0:2]
-        img_size = (self._img_size[1], self._img_size[0])
-        if img_size[0] != width_original or img_size[1] != height_original:
-            image = cv2.resize(image, img_size, interpolation=cv2.INTER_NEAREST)
-        image = image[self._top_cutoff :, :, :]
+        # TODO: in new-deal, not only top, maybe also w cutoff
+        image = image[self._top_cutoff:, :, :]
 
         # Extract the line segments for every color
-        self.detector.setImage(image)
-        detections = {
-            color: self.detector.detectLines(ranges) for color, ranges in list(self.color_ranges.items())
-        }
+        lst_detections: List[Detections] = self.detector.detect(image=image, colors=list(self.color_ranges.values()))
+        detections: Dict[str, Detections] = dict(zip(self.color_range.keys(), lst_detections))
 
         # Construct a SegmentList
         segment_list = SegmentList()
@@ -166,6 +157,7 @@ class LineDetectorNode(DTROS):
         arr_ratio = np.array(
             [
                 1.0 / self._img_size[1],
+                # TODO: related to above, it's kept here only cuz the ratio is assumed to be the same as the original
                 1.0 / self._img_size[0],
                 1.0 / self._img_size[1],
                 1.0 / self._img_size[0],
@@ -191,31 +183,33 @@ class LineDetectorNode(DTROS):
 
         # If there are any subscribers to the debug topics, generate a debug image and publish it
         if self.pub_d_segments.get_num_connections() > 0:
-            colorrange_detections = {self.color_ranges[c]: det for c, det in list(detections.items())}
-            debug_img = plotSegments(image, colorrange_detections)
+            d_range2det = {self.color_ranges[c]: det for c, det in list(detections.items())}
+            debug_img = draw_segments(image, d_range2det)
             debug_image_msg = self.bridge.cv2_to_compressed_imgmsg(debug_img)
             debug_image_msg.header = image_msg.header
             self.pub_d_segments.publish(debug_image_msg)
 
-        if self.pub_d_edges.get_num_connections() > 0:
-            debug_image_msg = self.bridge.cv2_to_compressed_imgmsg(self.detector.canny_edges)
-            debug_image_msg.header = image_msg.header
-            self.pub_d_edges.publish(debug_image_msg)
+        # TODO: intermediate canny_edges not available in detector lib
+        # if self.pub_d_edges.get_num_connections() > 0:
+        #     debug_image_msg = self.bridge.cv2_to_compressed_imgmsg(self.detector.canny_edges)
+        #     debug_image_msg.header = image_msg.header
+        #     self.pub_d_edges.publish(debug_image_msg)
 
         if self.pub_d_maps.get_num_connections() > 0:
-            colorrange_detections = {self.color_ranges[c]: det for c, det in list(detections.items())}
-            debug_img = plotMaps(image, colorrange_detections)
+            d_range2det = {self.color_ranges[c]: det for c, det in list(detections.items())}
+            debug_img = draw_maps(image, d_range2det)
             debug_image_msg = self.bridge.cv2_to_compressed_imgmsg(debug_img)
             debug_image_msg.header = image_msg.header
             self.pub_d_maps.publish(debug_image_msg)
 
-        for channels in ["HS", "SV", "HV"]:
-            publisher = getattr(self, f"pub_d_ranges_{channels}")
-            if publisher.get_num_connections() > 0:
-                debug_img = self._plot_ranges_histogram(channels)
-                debug_image_msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
-                debug_image_msg.header = image_msg.header
-                publisher.publish(debug_image_msg)
+        # TODO: hsv missing in line_detector in lib
+        # for channels in ["HS", "SV", "HV"]:
+        #     publisher = getattr(self, f"pub_d_ranges_{channels}")
+        #     if publisher.get_num_connections() > 0:
+        #         debug_img = self._plot_ranges_histogram(channels)
+        #         debug_image_msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
+        #         debug_image_msg.header = image_msg.header
+        #         publisher.publish(debug_image_msg)
 
     @staticmethod
     def _to_segment_msg(lines, normals, color):
@@ -246,76 +240,76 @@ class LineDetectorNode(DTROS):
             segment_msg_list.append(segment)
         return segment_msg_list
 
-    def _plot_ranges_histogram(self, channels):
-        """Utility method for plotting color histograms and color ranges.
-
-        Args:
-            channels (:obj:`str`): The desired two channels, should be one of ``['HS','SV','HV']``
-
-        Returns:
-            :obj:`numpy array`: The resultant plot image
-
-        """
-        channel_to_axis = {"H": 0, "S": 1, "V": 2}
-        axis_to_range = {0: 180, 1: 256, 2: 256}
-
-        # Get which is the third channel that will not be shown in this plot
-        missing_channel = "HSV".replace(channels[0], "").replace(channels[1], "")
-
-        hsv_im = self.detector.hsv
-        # Get the pixels as a list (flatten the horizontal and vertical dimensions)
-        hsv_im = hsv_im.reshape((-1, 3))
-
-        channel_idx = [channel_to_axis[channels[0]], channel_to_axis[channels[1]]]
-
-        # Get only the relevant channels
-        x_bins = np.arange(0, axis_to_range[channel_idx[1]] + 1, 2)
-        y_bins = np.arange(0, axis_to_range[channel_idx[0]] + 1, 2)
-        h, _, _ = np.histogram2d(
-            x=hsv_im[:, channel_idx[0]], y=hsv_im[:, channel_idx[1]], bins=[y_bins, x_bins]
-        )
-        # Log-normalized histogram
-        np.log(h, out=h, where=(h != 0))
-        h = (255 * h / np.max(h)).astype(np.uint8)
-
-        # Make a color map, for the missing channel, just take the middle of the range
-        if channels not in self.colormaps:
-            colormap_1, colormap_0 = np.meshgrid(x_bins[:-1], y_bins[:-1])
-            colormap_2 = np.ones_like(colormap_0) * (axis_to_range[channel_to_axis[missing_channel]] / 2)
-
-            channel_to_map = {channels[0]: colormap_0, channels[1]: colormap_1, missing_channel: colormap_2}
-
-            self.colormaps[channels] = np.stack(
-                [channel_to_map["H"], channel_to_map["S"], channel_to_map["V"]], axis=-1
-            ).astype(np.uint8)
-            self.colormaps[channels] = cv2.cvtColor(self.colormaps[channels], cv2.COLOR_HSV2BGR)
-
-        # resulting histogram image as a blend of the two images
-        im = cv2.cvtColor(h[:, :, None], cv2.COLOR_GRAY2BGR)
-        im = cv2.addWeighted(im, 0.5, self.colormaps[channels], 1 - 0.5, 0.0)
-
-        # now plot the color ranges on top
-        for _, color_range in list(self.color_ranges.items()):
-            # convert HSV color to BGR
-            c = color_range.representative
-            c = np.uint8([[[c[0], c[1], c[2]]]])
-            color = cv2.cvtColor(c, cv2.COLOR_HSV2BGR).squeeze().astype(int)
-            for i in range(len(color_range.low)):
-                cv2.rectangle(
-                    im,
-                    pt1=(
-                        (color_range.high[i, channel_idx[1]] / 2).astype(np.uint8),
-                        (color_range.high[i, channel_idx[0]] / 2).astype(np.uint8),
-                    ),
-                    pt2=(
-                        (color_range.low[i, channel_idx[1]] / 2).astype(np.uint8),
-                        (color_range.low[i, channel_idx[0]] / 2).astype(np.uint8),
-                    ),
-                    color=color,
-                    lineType=cv2.LINE_4,
-                )
-        # ---
-        return im
+    # def _plot_ranges_histogram(self, channels):
+    #     """Utility method for plotting color histograms and color ranges.
+    #
+    #     Args:
+    #         channels (:obj:`str`): The desired two channels, should be one of ``['HS','SV','HV']``
+    #
+    #     Returns:
+    #         :obj:`numpy array`: The resultant plot image
+    #
+    #     """
+    #     channel_to_axis = {"H": 0, "S": 1, "V": 2}
+    #     axis_to_range = {0: 180, 1: 256, 2: 256}
+    #
+    #     # Get which is the third channel that will not be shown in this plot
+    #     missing_channel = "HSV".replace(channels[0], "").replace(channels[1], "")
+    #
+    #     hsv_im = self.detector.hsv
+    #     # Get the pixels as a list (flatten the horizontal and vertical dimensions)
+    #     hsv_im = hsv_im.reshape((-1, 3))
+    #
+    #     channel_idx = [channel_to_axis[channels[0]], channel_to_axis[channels[1]]]
+    #
+    #     # Get only the relevant channels
+    #     x_bins = np.arange(0, axis_to_range[channel_idx[1]] + 1, 2)
+    #     y_bins = np.arange(0, axis_to_range[channel_idx[0]] + 1, 2)
+    #     h, _, _ = np.histogram2d(
+    #         x=hsv_im[:, channel_idx[0]], y=hsv_im[:, channel_idx[1]], bins=[y_bins, x_bins]
+    #     )
+    #     # Log-normalized histogram
+    #     np.log(h, out=h, where=(h != 0))
+    #     h = (255 * h / np.max(h)).astype(np.uint8)
+    #
+    #     # Make a color map, for the missing channel, just take the middle of the range
+    #     if channels not in self.colormaps:
+    #         colormap_1, colormap_0 = np.meshgrid(x_bins[:-1], y_bins[:-1])
+    #         colormap_2 = np.ones_like(colormap_0) * (axis_to_range[channel_to_axis[missing_channel]] / 2)
+    #
+    #         channel_to_map = {channels[0]: colormap_0, channels[1]: colormap_1, missing_channel: colormap_2}
+    #
+    #         self.colormaps[channels] = np.stack(
+    #             [channel_to_map["H"], channel_to_map["S"], channel_to_map["V"]], axis=-1
+    #         ).astype(np.uint8)
+    #         self.colormaps[channels] = cv2.cvtColor(self.colormaps[channels], cv2.COLOR_HSV2BGR)
+    #
+    #     # resulting histogram image as a blend of the two images
+    #     im = cv2.cvtColor(h[:, :, None], cv2.COLOR_GRAY2BGR)
+    #     im = cv2.addWeighted(im, 0.5, self.colormaps[channels], 1 - 0.5, 0.0)
+    #
+    #     # now plot the color ranges on top
+    #     for _, color_range in list(self.color_ranges.items()):
+    #         # convert HSV color to BGR
+    #         c = color_range.representative
+    #         c = np.uint8([[[c[0], c[1], c[2]]]])
+    #         color = cv2.cvtColor(c, cv2.COLOR_HSV2BGR).squeeze().astype(int)
+    #         for i in range(len(color_range.low)):
+    #             cv2.rectangle(
+    #                 im,
+    #                 pt1=(
+    #                     (color_range.high[i, channel_idx[1]] / 2).astype(np.uint8),
+    #                     (color_range.high[i, channel_idx[0]] / 2).astype(np.uint8),
+    #                 ),
+    #                 pt2=(
+    #                     (color_range.low[i, channel_idx[1]] / 2).astype(np.uint8),
+    #                     (color_range.low[i, channel_idx[0]] / 2).astype(np.uint8),
+    #                 ),
+    #                 color=color,
+    #                 lineType=cv2.LINE_4,
+    #             )
+    #     # ---
+    #     return im
 
 
 if __name__ == "__main__":
