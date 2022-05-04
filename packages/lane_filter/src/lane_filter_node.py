@@ -7,9 +7,11 @@ import rospy
 from cv_bridge import CvBridge
 from duckietown.dtros import DTROS, NodeType, TopicType
 from duckietown_msgs.msg import FSMState, LanePose, SegmentList, Twist2DStamped
-from lane_filter import LaneFilterHistogram
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+
+from dt_state_estimation.lane_filter import LaneFilterHistogram
+# from dt_state_estimation.lane_filter.types import Segment, SegmentColor, SegmentPoint
 
 
 class LaneFilterNode(DTROS):
@@ -143,7 +145,7 @@ class LaneFilterNode(DTROS):
         current_time = rospy.get_time()
         if self.currentVelocity:
             dt = current_time - self.t_last_update
-            self.filter.predict(dt=dt, v=self.currentVelocity.v, w=self.currentVelocity.omega)
+            self.filter.predict(delta_t=dt, v=self.currentVelocity.v, w=self.currentVelocity.omega)
 
         self.t_last_update = current_time
 
@@ -151,25 +153,23 @@ class LaneFilterNode(DTROS):
         self.filter.update(segment_list_msg.segments)
 
         # Step 3: build messages and publish things
-        [d_max, phi_max] = self.filter.getEstimate()
-        # print "d_max = ", d_max
-        # print "phi_max = ", phi_max
+        d_max, phi_max = self.filter.get_estimate()
 
         # Getting the highest belief value from the belief matrix
-        max_val = self.filter.getMax()
+        max_val = self.filter.get_max()
         # Comparing it to a minimum belief threshold to make sure we are certain enough of our estimate
         in_lane = max_val > self.filter.min_max
 
         # build lane pose message to send
-        lanePose = LanePose()
-        lanePose.header.stamp = segment_list_msg.header.stamp
-        lanePose.d = d_max
-        lanePose.phi = phi_max
-        lanePose.in_lane = in_lane
+        lane_pose = LanePose()
+        lane_pose.header.stamp = segment_list_msg.header.stamp
+        lane_pose.d = d_max
+        lane_pose.phi = phi_max
+        lane_pose.in_lane = in_lane
         # XXX: is it always NORMAL?
-        lanePose.status = lanePose.NORMAL
+        lane_pose.status = lane_pose.NORMAL
 
-        self.pub_lane_pose.publish(lanePose)
+        self.pub_lane_pose.publish(lane_pose)
         self.debugOutput(segment_list_msg, d_max, phi_max, timestamp_before_processing)
 
     def debugOutput(self, segment_list_msg, d_max, phi_max, timestamp_before_processing):
