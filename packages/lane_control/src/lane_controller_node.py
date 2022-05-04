@@ -12,7 +12,8 @@ from duckietown_msgs.msg import (
     StopLineReading,
 )
 
-from lane_controller.controller import LaneController
+# from lane_controller.controller import LaneController
+from dt_motion_planning.lane_controller import PIDLaneController
 
 
 class LaneControllerNode(DTROS):
@@ -76,7 +77,7 @@ class LaneControllerNode(DTROS):
         self.params["~stop_line_slowdown"] = rospy.get_param("~stop_line_slowdown", None)
 
         # Need to create controller object before updating parameters, otherwise it will fail
-        self.controller = LaneController(self.params)
+        self.controller = PIDLaneController(*self.params)  # TODO: verify order, or use kwargs actually
         # self.updateParameters() # TODO: This needs be replaced by the new DTROS callback when it is implemented
 
         # Initialize variables
@@ -171,6 +172,7 @@ class LaneControllerNode(DTROS):
 
             self.pose_msg = input_pose_msg
 
+            self.controller.update(input_pose_msg.d, input_pose_msg.phi, rospy.Time.now().to_sec())
             self.getControlAction(self.pose_msg)
 
     def cbWheelsCmdExecuted(self, msg_wheels_cmd):
@@ -218,17 +220,19 @@ class LaneControllerNode(DTROS):
 
             wheels_cmd_exec = [self.wheels_cmd_executed.vel_left, self.wheels_cmd_executed.vel_right]
             if self.obstacle_stop_line_detected:
-                v, omega = self.controller.compute_control_action(
-                    d_err, phi_err, dt, wheels_cmd_exec, self.obstacle_stop_line_distance
-                )
+                v, omega = self.controller.compute_commands()
+                # (
+                #     d_err, phi_err, dt, wheels_cmd_exec, self.obstacle_stop_line_distance  # TODO: where are the rest 2 in lib?
+                # )
                 # TODO: This is a temporarily fix to avoid vehicle image detection latency caused unable to stop in time.
                 v = v * 0.25
                 omega = omega * 0.25
 
             else:
-                v, omega = self.controller.compute_control_action(
-                    d_err, phi_err, dt, wheels_cmd_exec, self.stop_line_distance
-                )
+                # v, omega = self.controller.compute_control_action(
+                #     d_err, phi_err, dt, wheels_cmd_exec, self.stop_line_distance
+                # )
+                v, omega = self.controller.compute_commands()
 
             # For feedforward action (i.e. during intersection navigation)
             omega += self.params["~omega_ff"]
